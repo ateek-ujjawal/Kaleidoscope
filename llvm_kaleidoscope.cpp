@@ -1,3 +1,4 @@
+#include "include/KaleidoscopeJIT.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/BasicBlock.h"
@@ -7,12 +8,31 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/PassManager.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Passes/StandardInstrumentations.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Scalar/GVN.h"
+#include "llvm/Transforms/Scalar/Reassociate.h"
+#include "llvm/Transforms/Scalar/SimplifyCFG.h"
+#include <algorithm>
+#include <cassert>
+#include <cctype>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <string>
 #include <vector>
+
+using namespace llvm;
+using namespace llvm::orc;
 
 ////////////////////////////////////////// Lexer /////////////////////////////////////////////
 
@@ -275,31 +295,31 @@ static std::unique_ptr<ExprAST> ParseBinOpRHS(int ExprPrec,
                                               std::unique_ptr<ExprAST> LHS) {
   // If this is a binary operator, find it's precedence
   while (true) {
-  int TokPrec = GetTokPrecedence();
+    int TokPrec = GetTokPrecedence();
 
-  // If this is a binary operator that binds as tightly as
-  if (TokPrec < ExprPrec)
-  return LHS;
+    // If this is a binary operator that binds as tightly as
+    if (TokPrec < ExprPrec)
+      return LHS;
 
-  int BinOp = CurTok;
-  getNextToken();
+    int BinOp = CurTok;
+    getNextToken();
 
-  // Parse primary expressions after binary operator
-  auto RHS = ParsePrimary();
-  if (!RHS)
-  return nullptr;
+    // Parse primary expressions after binary operator
+    auto RHS = ParsePrimary();
+    if (!RHS)
+      return nullptr;
 
-  // If binop binds less tightly with RHS, than with the
-  // binary operator after RHS, let the pending operator take RHS as it's LHS
-  int NextPrec = GetTokPrecedence();
-  if (TokPrec < NextPrec) {
-  RHS = ParseBinOpRHS(TokPrec+1, std::move(RHS));
-  if (!RHS)
-  return nullptr;
-  }
+    // If binop binds less tightly with RHS, than with the
+    // binary operator after RHS, let the pending operator take RHS as it's LHS
+    int NextPrec = GetTokPrecedence();
+    if (TokPrec < NextPrec) {
+      RHS = ParseBinOpRHS(TokPrec+1, std::move(RHS));
+      if (!RHS)
+        return nullptr;
+    }
 
-  // Merge LHS/RHS
-  LHS = std::make_unique<BinaryExprAST>(BinOp, std::move(LHS), std::move(RHS));
+    // Merge LHS/RHS
+    LHS = std::make_unique<BinaryExprAST>(BinOp, std::move(LHS), std::move(RHS));
   }
 }
 
@@ -361,7 +381,7 @@ static std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
   if (auto E = ParseExpression()) {
     // Make anonymous proto
 
-    auto Proto = std::make_unique<PrototypeAST>("", std::vector<std::string>());
+    auto Proto = std::make_unique<PrototypeAST>("__anon_expr", std::vector<std::string>());
     return std::make_unique<FunctionAST>(std::move(Proto), std::move(E));
   }
   return nullptr;
@@ -372,9 +392,34 @@ static std::unique_ptr<llvm::LLVMContext> TheContext;
 static std::unique_ptr<llvm::IRBuilder<>> Builder;
 static std::unique_ptr<llvm::Module> TheModule;
 static std::map<std::string, llvm::Value*> NamedValues;
+static std::unique_ptr<KaleidoscopeJIT> TheJIT;
+static std::unique_ptr<FunctionPassManager> TheFPM;
+static std::unique_ptr<LoopAnalysisManager> TheLAM;
+static std::unique_ptr<FunctionAnalysisManager> TheFAM;
+static std::unique_ptr<CGSCCAnalysisManager> TheCGAM;
+static std::unique_ptr<ModuleAnalysisManager> TheMAM;
+static std::unique_ptr<PassInstrumentationCallbacks> ThePIC;
+static std::unique_ptr<StandardInstrumentations> TheSI;
+static std::map<std::string, std::unique_ptr<PrototypeAST>> FunctionProtos;
+static ExitOnError ExitOnErr;
 
 llvm::Value *LogErrorV(const char *Str) {
   LogError(Str);
+  return nullptr;
+}
+
+Function *getFunction(std::string Name) {
+  // First, see if function has already been added to the current module.
+  if (auto *F = TheModule->getFunction(Name))
+    return F;
+
+  // If not, check whether we can codegen the declaration from some existing
+  // prototype
+  auto FI = FunctionProtos.find(Name);
+  if (FI != FunctionProtos.end())
+    return FI->second->codegen();
+
+  // If no existing prototype exists, return null
   return nullptr;
 }
 
@@ -418,7 +463,7 @@ llvm::Value *BinaryExprAST::codegen() {
 
 llvm::Value *CallExprAST::codegen() {
   // Lookup name in global module table;
-  llvm::Function *CalleeF = TheModule->getFunction(Callee);
+  llvm::Function *CalleeF = getFunction(Callee);
   if (!CalleeF)
     return LogErrorV("Unknown function referenced");
 
@@ -453,17 +498,14 @@ llvm::Function* PrototypeAST::codegen() {
 }
 
 llvm::Function* FunctionAST::codegen() {
-  // Check for existing function from a previous extern declaration
-  llvm::Function *TheFunction = TheModule->getFunction(Proto->getName());
-
-  if (!TheFunction)
-    TheFunction = Proto->codegen();
+  // Transfer ownership of prototype to FunctionProtos map, keep
+  // reference to it for use below
+  auto &P = *Proto;
+  FunctionProtos[Proto->getName()] = std::move(Proto);
+  Function *TheFunction = getFunction(P.getName());
 
   if (!TheFunction)
     return nullptr;
-
-  if (!TheFunction->empty())
-    return (llvm::Function*)LogErrorV("Function cannot be redefined.");
 
   // Create a basic block to start insertion into
   llvm::BasicBlock *BB = llvm::BasicBlock::Create(*TheContext, "entry", TheFunction);
@@ -479,7 +521,11 @@ llvm::Function* FunctionAST::codegen() {
     // Finish off the function
     Builder->CreateRet(RetVal);
 
+    // Validate generated code, checking for consistency
     verifyFunction(*TheFunction);
+
+    // Optimize the function
+    TheFPM->run(*TheFunction, *TheFAM);
 
     return TheFunction;
   }
@@ -490,13 +536,41 @@ llvm::Function* FunctionAST::codegen() {
 }
 
 ////////////////////////////// Top-level Parsing //////////////////////
-static void InitializeModule() {
+static void InitializeModuleAndManagers() {
   // Open a new context and module.
   TheContext = std::make_unique<llvm::LLVMContext>();
-  TheModule = std::make_unique<llvm::Module>("my cool jit", *TheContext);
+  TheModule = std::make_unique<llvm::Module>("KaleidoscopeJIT", *TheContext);
+  TheModule->setDataLayout(TheJIT->getDataLayout());
 
   // Create a new builder for the module.
   Builder = std::make_unique<llvm::IRBuilder<>>(*TheContext);
+
+  // Create new pass and analysis managers
+  TheFPM = std::make_unique<FunctionPassManager>();
+  TheLAM = std::make_unique<LoopAnalysisManager>();
+  TheFAM = std::make_unique<FunctionAnalysisManager>();
+  TheCGAM = std::make_unique<CGSCCAnalysisManager>();
+  TheMAM = std::make_unique<ModuleAnalysisManager>();
+  ThePIC = std::make_unique<PassInstrumentationCallbacks>();
+  TheSI = std::make_unique<StandardInstrumentations>(*TheContext,
+                                                    /*DebugLogging*/ true);
+  TheSI->registerCallbacks(*ThePIC, TheMAM.get());
+
+  // Add transform passes
+  // Do simple 'peephole' optimizations and bit-twiddling optzns
+  TheFPM->addPass(InstCombinePass());
+  // Reassociate expressions
+  TheFPM->addPass(ReassociatePass());
+  // Eliminate Common SubExpressions
+  TheFPM->addPass(GVNPass());
+  // Simplify Control Flow Graph (delete unreachable blocks, etc.)
+  TheFPM->addPass(SimplifyCFGPass());
+
+  // Register analysis passes used in these transform passes
+  PassBuilder PB;
+  PB.registerModuleAnalyses(*TheMAM);
+  PB.registerFunctionAnalyses(*TheFAM);
+  PB.crossRegisterProxies(*TheLAM, *TheFAM, *TheCGAM, *TheMAM);
 }
 
 static void HandleDefinition() {
@@ -505,6 +579,9 @@ static void HandleDefinition() {
       fprintf(stderr, "Read function definition:");
       FnIR->print(llvm::errs());
       fprintf(stderr, "\n");
+      ExitOnErr(TheJIT->addModule(
+          ThreadSafeModule(std::move(TheModule), std::move(TheContext))));
+      InitializeModuleAndManagers();
     }
   } else {
     // skip token for error recovery.
@@ -518,6 +595,7 @@ static void HandleExtern() {
       fprintf(stderr, "Read extern: ");
       FnIR->print(llvm::errs());
       fprintf(stderr, "\n");
+      FunctionProtos[ProtoAST->getName()] = std::move(ProtoAST);
     }
   } else {
     // skip token for error recovery.
@@ -528,12 +606,24 @@ static void HandleExtern() {
 static void HandleTopLevelExpression() {
   if (auto FnAST = ParseTopLevelExpr()) {
     if (auto *FnIR = FnAST->codegen()){
-      fprintf(stderr, "Read top-level expression:");
-      FnIR->print(llvm::errs());
-      fprintf(stderr, "\n");
+      // Create resource tracker to track JIT'd memory allocated
+      // to our anonymous expression, to free it after execution
+      auto RT = TheJIT->getMainJITDylib().createResourceTracker();
 
-      // Remove the anonymous expression.
-      FnIR->eraseFromParent();
+      auto TSM = ThreadSafeModule(std::move(TheModule), std::move(TheContext));
+      ExitOnErr(TheJIT->addModule(std::move(TSM), RT));
+      InitializeModuleAndManagers();
+
+      // Search the JIT for the __anon_expr symbol
+      auto ExprSymbol = ExitOnErr(TheJIT->lookup("__anon_expr"));
+
+      // Get symbol's address and cast it to the right type so
+      // we can call it as a native function
+      double (*FP)() = ExprSymbol.getAddress().toPtr<double (*)()>();
+      fprintf(stderr, "Evaluated to %f\n", FP());
+
+      // Delete anonymous expression module from the JIT
+      ExitOnErr(RT->remove());
     }
   } else {
     // skip token for error recovery.
@@ -566,6 +656,10 @@ static void MainLoop() {
 
 ////////////////////////////////// Driver code /////////////////////////
 int main() {
+  InitializeNativeTarget();
+  InitializeNativeTargetAsmPrinter();
+  InitializeNativeTargetAsmParser();
+
   // Install standard binary operators
   // 1 is the lowest precedence according to this order
   BinopPrecedence['<'] = 10;
@@ -577,8 +671,10 @@ int main() {
   fprintf(stderr, "ready> ");
   getNextToken();
 
+  TheJIT = ExitOnErr(KaleidoscopeJIT::Create());
+
   // Make the module, which holds all the code.
-  InitializeModule();
+  InitializeModuleAndManagers();
 
   // Run the main "interpreter loop" now.
   MainLoop();
